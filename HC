@@ -1,0 +1,233 @@
+import numpy as np
+import random
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import matplotlib.pyplot as plt
+import pandas as pd
+import openseespy.opensees as ops
+import pickle
+
+# 环境类，生成滞回曲线并与智能体交互
+class HysteresisEnv:
+    def __init__(self):
+        self.param_ranges = [[200, 400], [100, 200], [0.05, 0.2]]  # 参数范围
+        self.current_params = self.random_params()
+        self.protocol = [1., 2., 3., 2., 1., 0., -1., -2., -3., -2., -1., 0.]  # 滞回加载协议
+        self.target_curve = None
+
+    def random_params(self):
+        return [random.uniform(*r) for r in self.param_ranges]
+
+    def hysteretic_curve(self, params):
+        ops.wipe()
+        ops.model("basic", "-ndm", 1, "-ndf", 1)
+        ops.node(1, 0.0)
+        ops.node(2, 0.0)
+        ops.fix(1, 1)
+        ops.uniaxialMaterial("Steel01", 1, params[0], params[1], params[2])
+        ops.element("twoNodeLink", 1, 1, 2, "-mat", 1, "-dir", 1)
+        ops.timeSeries("Linear", 1)
+        ops.pattern("Plain", 1, 1)
+        ops.load(2, 1.0)
+        ops.algorithm("Newton")
+        ops.integrator("DisplacementControl", 2, 1, 1)
+        ops.constraints("Transformation")
+        ops.numberer("RCM")
+        ops.system("BandSPD")
+        ops.analysis("Static")
+
+        protocol_size = len(self.protocol)
+        result = []
+        for i in range(protocol_size):
+            disp = self.protocol[i] if i == 0 else self.protocol[i] - self.protocol[i - 1]
+            ops.integrator("DisplacementControl", 2, 1, disp)
+            if ops.analyze(1) == 0:
+                result.append(ops.eleForce(1)[1])
+            else:
+                result.append(0.0)  # Failure case
+        ops.wipe()
+        return np.array(result)
+
+    def step(self, action):
+        # 映射 Actor 输出到参数范围
+        scaled_action = [(a + 1) / 2 * (r[1] - r[0]) + r[0] for a, r in zip(action, self.param_ranges)]
+        self.current_params = [
+            max(min(p + a, r[1]), r[0]) for p, a, r in zip(self.current_params, scaled_action, self.param_ranges)
+        ]
+        new_curve = self.hysteretic_curve(self.current_params)
+        reward = -np.linalg.norm((new_curve - self.target_curve) / (np.abs(self.target_curve) + 1e-6))
+        return self.current_params, reward
+
+    def reset(self, target_params):
+        self.current_params = self.random_params()
+        self.target_curve = self.hysteretic_curve(target_params)
+        return self.current_params
+
+# Actor网络
+class Actor(nn.Module):
+    def __init__(self, input_dim, output_dim):
+        super(Actor, self).__init__()
+        self.fc = nn.Sequential(
+            nn.Linear(input_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, 128),
+            nn.ReLU(),
+            nn.Linear(128, output_dim),
+            nn.Tanh()
+        )
+
+    def forward(self, x):
+        return self.fc(x)
+
+# Critic网络
+class Critic(nn.Module):
+    def __init__(self, input_dim):
+        super(Critic, self).__init__()
+        self.fc = nn.Sequential(
+            nn.Linear(input_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, 128),
+            nn.ReLU(),
+            nn.Linear(128, 1)
+        )
+
+    def forward(self, x):
+        return self.fc(x)
+
+# Replay Buffer
+class ReplayBuffer:
+    def __init__(self, capacity, filename='replay_buffer.pkl'):
+        self.buffer = []
+        self.capacity = capacity
+        self.filename = filename  # 文件名用于保存和加载缓冲区数据
+
+    def add(self, experience):
+        if len(self.buffer) >= self.capacity:
+            self.buffer.pop(0)
+        self.buffer.append(experience)
+
+    def sample(self, batch_size):
+        return random.sample(self.buffer, batch_size)
+
+    def save(self):
+        with open(self.filename, 'wb') as f:
+            pickle.dump(self.buffer, f)
+        # 将缓冲区数据保存到文件
+
+    def load(self):
+        try:
+            with open(self.filename, 'rb') as f:
+                self.buffer = pickle.load(f)
+        except FileNotFoundError:
+            print(f"File {self.filename} not found. Starting with an empty buffer.")
+            self.buffer = []
+        # 从文件加载缓冲区数据
+
+# 训练过程
+def train(env, actor, critic, actor_optimizer, critic_optimizer, buffer, num_episodes=500):
+    gamma = 0.99
+    batch_size = 64
+    rewards = []
+    plt.ion()
+    fig, ax = plt.subplots()
+    env.reset(target_params=[300, 150, 0.1])  # 初始化 target_curve
+    line_target, = ax.plot(env.protocol, env.target_curve, label='Target', color='blue')
+    line_fitted, = ax.plot(env.protocol, env.hysteretic_curve(env.current_params), label='Fitted', color='red')
+    ax.legend()
+    ax.set_xlabel('Protocol')
+    ax.set_ylabel('Force')
+
+    for episode in range(num_episodes):
+        state = env.reset(target_params=[300, 150, 0.1])
+        episode_reward = 0
+        for t in range(200):
+            state_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0)
+            action = actor(state_tensor).detach().numpy().flatten()
+            next_state, reward = env.step(action)
+            buffer.add((state, action, reward, next_state))
+            episode_reward += reward
+
+            if len(buffer.buffer) >= batch_size:
+                batch = buffer.sample(batch_size)
+                states, actions, rewards_batch, next_states = zip(*batch)
+                states = torch.tensor(states, dtype=torch.float32)
+                actions = torch.tensor(actions, dtype=torch.float32)
+                rewards_batch = torch.tensor(rewards_batch, dtype=torch.float32).unsqueeze(1)
+                next_states = torch.tensor(next_states, dtype=torch.float32)
+
+                # Critic更新
+                predicted_actions = actor(next_states)
+                target_values = rewards_batch + gamma * critic(torch.cat((next_states, predicted_actions), dim=1)).detach()
+                values = critic(torch.cat((states, actions), dim=1))
+                critic_loss = nn.MSELoss()(values, target_values)
+                critic_optimizer.zero_grad()
+                critic_loss.backward()
+                critic_optimizer.step()
+
+                # Actor更新
+                actor_loss = -critic(torch.cat((states, actor(states)), dim=1)).mean()
+                actor_optimizer.zero_grad()
+                actor_loss.backward()
+                actor_optimizer.step()
+
+            state = next_state
+
+        rewards.append(episode_reward)
+
+        # 动态更新拟合图
+        fitted_curve = env.hysteretic_curve(env.current_params)
+        line_fitted.set_ydata(fitted_curve)
+        plt.draw()
+        plt.pause(0.1)
+
+        # 保存关键帧图片
+        if episode % 50 == 0:
+            plt.savefig(f'fitted_curve_episode_{episode}.png')
+
+        # 每隔一段时间保存缓冲区数据到硬盘
+        if episode % 100 == 0:
+            buffer.save()
+            print(f"Saved replay buffer at episode {episode}")
+
+        print(f"Episode {episode + 1}, Reward: {episode_reward}")
+
+    plt.ioff()
+    return rewards
+
+# 主函数
+if __name__ == "__main__":
+    env = HysteresisEnv()
+    actor = Actor(input_dim=3, output_dim=3)
+    critic = Critic(input_dim=6)
+    actor_optimizer = optim.Adam(actor.parameters(), lr=1e-3)
+    critic_optimizer = optim.Adam(critic.parameters(), lr=1e-3)
+    buffer = ReplayBuffer(capacity=10000, filename='replay_buffer.pkl')
+
+    # 尝试从硬盘加载缓冲区数据
+    buffer.load()
+    rewards = train(env, actor, critic, actor_optimizer, critic_optimizer, buffer)
+
+    # 保存训练历史
+    pd.DataFrame({
+        'Episode': list(range(len(rewards))),
+        'Reward': rewards
+    }).to_csv('training_history.csv', index=False)
+
+    # 保存模型
+    torch.save({
+        'actor_state_dict': actor.state_dict(),
+        'critic_state_dict': critic.state_dict(),
+        'actor_optimizer_state_dict': actor_optimizer.state_dict(),
+        'critic_optimizer_state_dict': critic_optimizer.state_dict(),
+        'env_params': env.current_params
+    }, 'checkpoint.pth')
+
+    # 绘制最终奖励图
+    plt.figure()
+    plt.plot(rewards)
+    plt.xlabel("Episodes")
+    plt.ylabel("Reward")
+    plt.title("Training Reward")
+    plt.grid(True)
+    plt.show()
