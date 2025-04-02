@@ -33,18 +33,17 @@ class HysteresisEnv:
     """
 
     def __init__(self):
-        self.param_ranges = [[100, 400], [100, 200]]  # 两个可调参数的取值范围
-        original_protocol = np.array([0, 1., 2., 3., 2., 1., 0., -1., -2., -3., -2., -1., 0.])
-        # 使用插值生成 2000 个数据点
-        self.protocol = np.interp(
-            np.linspace(0, 1, 2000),
-            np.linspace(0, 1, len(original_protocol)),
-            original_protocol
-        )
-        # 目标参数 (p1, p2, strainHardeningRatio)
-        self.target_params = [235, 123, 0.1]
-        # 为方便计算 reward，预先计算目标曲线及其范围
-        self.target_curve = self.hysteretic_curve(self.target_params)
+        self.param_ranges = [[100, 400], [50, 200]]  # 两个可调参数的取值范围
+        # 从 Excel 文件中读取数据
+        df = pd.read_excel(r"D:\Charles\PycharmProjects\PythonProject\.venv\ops\results.xlsx")
+        # 假设第一列列名为 'displacement'，第二列列名为 'force'
+        self.protocol = df["displacement"].values
+        self.target_curve = df["force"].values
+
+        # 可选：确保曲线起始点都是 (0, 0)
+        if self.protocol[0] != 0 or self.target_curve[0] != 0:
+            print("警告：目标曲线起始点不为 (0,0)，请检查数据！")
+
         self.target_range = np.max(self.target_curve) - np.min(self.target_curve)
         self.reset()
 
@@ -61,7 +60,7 @@ class HysteresisEnv:
         ops.node(2, 0.0)
         ops.fix(1, 1)
         # p1= params[0], p2= params[1], strainHardeningRatio= target_params[2]
-        ops.uniaxialMaterial("Steel01", 1, params[0], params[1], self.target_params[2])
+        ops.uniaxialMaterial("Steel01", 1, params[0], params[1], 0.1)
         ops.element("twoNodeLink", 1, 1, 2, "-mat", 1, "-dir", 1)
         ops.timeSeries("Linear", 1)
         ops.pattern("Plain", 1, 1)
@@ -95,10 +94,18 @@ class HysteresisEnv:
         并转换为 reward（曲线越逼近，reward 越大）。
         返回 (next_state, reward)
         """
+        # # 测试不同 Param2 值对曲线的影响
+        # params_low = [235, 123]  # 目标参数
+        # params_high = [235, 200]  # 当前问题参数
+        # curve_low = env.hysteretic_curve(params_low)
+        # curve_high = env.hysteretic_curve(params_high)
+        # error = np.linalg.norm(curve_high - env.target_curve)
+        # print(f"Param2=123 时误差: {np.linalg.norm(curve_low - env.target_curve):.2f}")
+        # print(f"Param2=200 时误差: {error:.2f}")
         scale_factors = [1, 1]  # 针对不同参数设置不同更新尺度
         new_params = []
         penalty = 0.0
-        margin_frac = 0.005  # 定义 5% 的边界区域
+        margin_frac = 0.05  # 定义 5% 的边界区域
         for i, (p, a, r, s) in enumerate(zip(self.current_params, action, self.param_ranges, scale_factors)):
             new_val = p + s * a
             # clip 到 [r[0], r[1]]
@@ -117,13 +124,15 @@ class HysteresisEnv:
         fitted_curve = self.hysteretic_curve(self.current_params)
         error_norm = np.linalg.norm(self.target_curve - fitted_curve, ord=2)
         # 计算基础 reward：误差越小，基础 reward 越大
-        # base_reward = np.exp(1 / ((1+error_norm)/ 10000)+1)
-        base_reward = 10000 / (0.01 + (error_norm / 1000) ** 2)
+        # 改为带有惩罚项的奖励
+        # base_reward = -error_norm - 0.1 * np.mean(np.abs(action))  # 惩罚大动作值
+        base_reward = 10000*np.exp(-error_norm/ 5000)
+        # base_reward = 10000 / (0.01 + (error_norm / 1000) )
         # 最终 reward = 基础 reward 减去边界惩罚项（乘以惩罚系数，可调）
         reward = base_reward - penalty * 500
 
         # 打印调试信息
-        print("Parameters:", self.current_params, "Error norm:", error_norm, "Penalty:", penalty, "Reward:", reward)
+        # print("Parameters:", self.current_params, "Error norm:", error_norm, "Penalty:", penalty, "Reward:", reward)
         return self.current_params, reward
 
         # scale_factors = [1, 1]  # 针对不同参数设置不同更新尺度
@@ -173,6 +182,8 @@ class Actor(nn.Module):
         )
 
     def forward(self, x):
+        x = (x - torch.tensor([250.0, 125.0])) / torch.tensor(
+            [150.0, 75.0])  # 假设 param_ranges 为 [[100, 400], [50, 200]]
         x = self.scaling(x)
         return self.fc(x)
 
@@ -234,7 +245,7 @@ class ReplayBuffer:
 
 
 # ========== 5. DDPG 常用的软更新函数 ==========
-def soft_update(target_net, source_net, tau=0.005):
+def soft_update(target_net, source_net, tau=0.01):
     for target_param, source_param in zip(target_net.parameters(), source_net.parameters()):
         target_param.data.copy_(
             target_param.data * (1.0 - tau) + source_param.data * tau
@@ -243,7 +254,7 @@ def soft_update(target_net, source_net, tau=0.005):
 
 # ========== 6. 训练函数：包含 DDPG 更新逻辑 ==========
 def train_ddpg(env, actor, critic, actor_optimizer, critic_optimizer,
-               buffer, num_episodes=100, max_steps=1000, batch_size=64, gamma=0.99):
+               buffer, num_episodes=50, max_steps=3000, batch_size=64, gamma=0.98):
     """
     - 引入目标网络 target_actor, target_critic
     - 每一步都把 (s, a, r, s') 存到 buffer，如果 buffer 中数据足够，就采样更新
@@ -261,7 +272,7 @@ def train_ddpg(env, actor, critic, actor_optimizer, critic_optimizer,
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
 
     # 预先计算目标曲线
-    target_curve = env.hysteretic_curve(env.target_params)
+    target_curve = env.target_curve
     target_min = np.min(target_curve)
     target_max = np.max(target_curve)
     fixed_xlim = (-3.5, 3.5)
@@ -273,7 +284,19 @@ def train_ddpg(env, actor, critic, actor_optimizer, critic_optimizer,
         step_rewards = []
 
         # 线性衰减探索
-        exploration_noise = max(0.1, 1 - episode / num_episodes)
+        # exploration_noise = max(0.1, 1 - episode / num_episodes)
+        # 指数衰减探索
+        exploration_noise = 0.8 * np.exp(-episode / 200)
+        # decay_rate = 0.1  # 根据需要调节衰减速度
+        # exploration_noise = max(0.1, 1 * np.exp(-decay_rate * episode))
+        # exploration_noise = 0.5 * np.exp(-episode / 100)  # 更平滑的衰减
+        # 非线性衰减探索
+        # if episode < num_episodes * 0.3:
+        #     # 前 30% 采用快速衰减
+        #     exploration_noise = max(0.1, 1 - 2 * episode / num_episodes)
+        # else:
+        #     # 后续采用较慢衰减
+        #     exploration_noise = max(0.1, 1 - episode / num_episodes)
 
         for step in range(max_steps):
             # 1. 从 actor 得到动作
@@ -293,6 +316,8 @@ def train_ddpg(env, actor, critic, actor_optimizer, critic_optimizer,
             step_rewards.append(reward)
             state = next_state
 
+            print(f"Step {step}: Params={env.current_params}")
+
             # 3. 可视化（每隔若干步）
             if step % 10 == 0:
                 fitted_curve = env.hysteretic_curve(env.current_params)
@@ -300,7 +325,7 @@ def train_ddpg(env, actor, critic, actor_optimizer, critic_optimizer,
                 ax1.plot(env.protocol, target_curve, 'b-', label='Target')
                 ax1.plot(env.protocol, fitted_curve, 'r--', label='Current')
                 param_info = "/".join([f"{p:.2f}" for p in env.current_params])
-                target_info = "/".join([f"{p:.2f}" for p in env.target_params])
+                target_info = "/".join([f"235, 123, 0.1"])
                 ax1.set_title(f'Episode {episode + 1} Step {step}\nCurrent: {param_info}\nTarget: {target_info}')
                 ax1.legend()
                 ax1.set_xlim(fixed_xlim)
@@ -338,6 +363,10 @@ def train_ddpg(env, actor, critic, actor_optimizer, critic_optimizer,
                 critic_optimizer.zero_grad()
                 critic_loss.backward()
                 critic_optimizer.step()
+                # 在Critic反向传播后添加
+                torch.nn.utils.clip_grad_norm_(critic.parameters(), max_norm=100.0)
+                # 在Critic更新后添加
+                print("Critic预测Q值范围:", current_q.min().item(), current_q.max().item())
 
                 # ---- Actor 更新 ----
                 current_actions = actor(states_b)
@@ -346,10 +375,13 @@ def train_ddpg(env, actor, critic, actor_optimizer, critic_optimizer,
                 actor_optimizer.zero_grad()
                 actor_loss.backward()
                 actor_optimizer.step()
+                # 在反向传播后添加
+                print("Actor梯度范数:", torch.norm(torch.cat([p.grad.flatten() for p in actor.parameters()])))
+                print("Critic梯度范数:", torch.norm(torch.cat([p.grad.flatten() for p in critic.parameters()])))
 
                 # ---- 软更新目标网络 ----
-                soft_update(target_actor, actor, tau=0.005)
-                soft_update(target_critic, critic, tau=0.005)
+                soft_update(target_actor, actor, tau=0.01)
+                soft_update(target_critic, critic, tau=0.01)
 
         rewards_history.append(episode_reward)
         print(f"Episode {episode + 1}/{num_episodes}, Reward: {episode_reward:.2f}")
@@ -365,16 +397,16 @@ if __name__ == "__main__":
     actor = Actor(state_dim=2, action_dim=2)
     critic = Critic(state_dim=2, action_dim=2)
 
-    actor_optimizer = optim.AdamW(actor.parameters(), lr=1e-4)
-    critic_optimizer = optim.AdamW(critic.parameters(), lr=3e-4)
+    actor_optimizer = optim.AdamW(actor.parameters(), lr=1e-5)
+    critic_optimizer = optim.AdamW(critic.parameters(), lr=1e-5)
     buffer = ReplayBuffer(capacity=500)
 
     rewards = train_ddpg(env, actor, critic, actor_optimizer, critic_optimizer,
                          buffer,
                          num_episodes=50,  # 可自行调节
-                         max_steps=1000,  # 每个 episode 的步数
+                         max_steps=3000,  # 每个 episode 的步数
                          batch_size=64,
-                         gamma=0.99)
+                         gamma=0.98)
 
     # 训练完可保存模型
     torch.save({
@@ -387,4 +419,4 @@ if __name__ == "__main__":
     final_params = env.current_params
     pd.DataFrame({'Episodes': range(len(rewards)), 'Rewards': rewards}).to_csv('training_history.csv', index=False)
     print(f"Final parameters: {final_params}")
-    print(f"Target parameters: {env.target_params}")
+    print(f"Target parameters: 235,123,0.1")
