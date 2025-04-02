@@ -35,7 +35,7 @@ class HysteresisEnv:
     def __init__(self):
         self.param_ranges = [[100, 400], [50, 200]]  # 两个可调参数的取值范围
         # 从 Excel 文件中读取数据
-        df = pd.read_excel(r"D:\Charles\PycharmProjects\PythonProject\.venv\ops\results.xlsx")
+        df = pd.read_excel("results.xlsx")
         # 假设第一列列名为 'displacement'，第二列列名为 'force'
         self.protocol = df["displacement"].values
         self.target_curve = df["force"].values
